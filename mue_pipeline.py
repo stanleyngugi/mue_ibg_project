@@ -3,25 +3,19 @@ from PIL import Image
 from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
 from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple
-# from tqdm.auto import tqdm # Keep this commented unless you need custom tqdm control
 import inspect # For checking default parameters of scheduler's step method
 
 # Assuming these modules are correctly implemented and available
-from dis_module import DISCalculator
-from gloss_module import GlossCalculator
+# from dis_module import DISCalculator # Uncomment if you have this
+# from gloss_module import GlossCalculator # Uncomment if you have this
 
 class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss).
-    (Version 5.0 - Comprehensive fix for Refiner added_cond_kwargs, efficient model loading,
-    and robust prompt encoding using temporary pipeline instances.)
-
-    This version resolves the `RuntimeError: mat1 and mat2 shapes cannot be multiplied`
-    by ensuring the Refiner's `added_cond_kwargs` are correctly structured:
-    `text_embeds` (pooled output) and `time_ids` (a 7-dimensional tensor combining
-    spatial info and aesthetic score). This aligns with the `StableDiffusionXLImg2ImgPipeline`'s
-    internal handling.
+    (Version 6.0 - Precise fix for Refiner added_cond_kwargs to prevent 2x3072 error.
+    Ensures _get_add_time_ids for refiner correctly bundles aesthetic score into the 7-dim tensor,
+    and added_cond_kwargs passed to refiner UNet only contains "text_embeds" and "time_ids".)
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -83,7 +77,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         if self._target_device.startswith("cuda") and self.torch_dtype == torch.float16:
             model_loading_kwargs["variant"] = "fp16"
         else:
-            model_loading_kwargs.pop("variant", None)
+            model_loading_kwargs.pop("variant", None) # Ensure variant is not set if not fp16
 
         # --- Load Components Efficiently ---
         print("Loading pipeline components...")
@@ -117,58 +111,64 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         if compile_models:
             print("Compiling models with torch.compile (mode='default', fullgraph=True)... This may take a while.")
             try:
+                # Compile UNets for denoising loop
                 self.unet_base = torch.compile(self.unet_base, mode="default", fullgraph=True)
                 self.unet_refiner = torch.compile(self.unet_refiner, mode="default", fullgraph=True)
+                # Compile VAE decoder for image generation
                 self.vae.decode = torch.compile(self.vae.decode, mode="default", fullgraph=True)
+                # Compile Text Encoders for prompt encoding
+                # These are usually smaller and might not yield as much gain, but can be included.
                 self.text_encoder_base = torch.compile(self.text_encoder_base, mode="default", fullgraph=True)
                 self.text_encoder_2_base = torch.compile(self.text_encoder_2_base, mode="default", fullgraph=True)
                 self.text_encoder_refiner = torch.compile(self.text_encoder_refiner, mode="default", fullgraph=True)
                 print("Models compiled successfully.")
             except Exception as e:
                 print(f"WARNING: torch.compile failed: {e}. Running without compilation.")
-                compile_models = False
+                compile_models = False # Reset flag if compilation fails
 
         print("MUEDiffusionPipeline initialization complete.")
 
     def _encode_prompt_helper(
         self,
-        text_encoder: Optional[torch.nn.Module], # CLIPTextModel for base, None for refiner
-        tokenizer: Any, # CLIPTokenizer for base, None for refiner
-        text_encoder_2: torch.nn.Module, # CLIPTextModelWithProjection (always used)
-        tokenizer_2: Any, # CLIPTokenizer (always used)
-        unet_model: torch.nn.Module, # The specific UNet for this stage (base or refiner)
-        scheduler_model: Any, # The specific Scheduler for this stage (base or refiner)
+        text_encoder: Optional[torch.nn.Module],
+        tokenizer: Any,
+        text_encoder_2: torch.nn.Module,
+        tokenizer_2: Any,
+        unet_model: torch.nn.Module,
+        scheduler_model: Any,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = "",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        A unified helper to encode prompts by temporarily constructing a pipeline,
-        ensuring correct handling of SDXL's dual text encoders.
+        A unified helper to encode prompts by temporarily constructing a minimal pipeline,
+        ensuring correct handling of SDXL's dual text encoders, mimicking diffusers'
+        encode_prompt behavior.
         """
         # Determine pipeline class based on whether text_encoder (CLIPTextModel) is used.
+        # Base uses both text_encoder and text_encoder_2. Refiner uses only text_encoder_2.
         pipeline_class = StableDiffusionXLPipeline if text_encoder is not None else StableDiffusionXLImg2ImgPipeline
         
-        # Temporarily create a pipeline instance to leverage its encode_prompt method
+        # Temporarily create a pipeline instance (only with necessary components for encode_prompt)
         temp_pipe = pipeline_class(
-            vae=self.vae,
+            vae=self.vae, # VAE is needed to satisfy pipeline init, but not for encode_prompt
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             text_encoder_2=text_encoder_2,
             tokenizer_2=tokenizer_2,
-            unet=unet_model,
-            scheduler=scheduler_model
+            unet=unet_model, # UNet is needed to satisfy pipeline init
+            scheduler=scheduler_model # Scheduler is needed to satisfy pipeline init
         )
 
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = \
             temp_pipe.encode_prompt(
                 prompt,
                 device=self._target_device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=True,
+                num_images_per_prompt=1, # Assume single image per prompt for simplicity
+                do_classifier_free_guidance=True, # Always prepare for CFG
                 negative_prompt=negative_prompt
             )
         
-        del temp_pipe # Clean up
+        del temp_pipe # Clean up temporary object to free memory
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
     def _get_add_time_ids(
@@ -176,51 +176,41 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         original_size: Tuple[int, int], 
         crops_coords_top_left: Tuple[int, int], 
         target_size: Tuple[int, int], 
-        aesthetic_score: Optional[float] = None, # Only for refiner, not base
+        aesthetic_score: Optional[float] = None, # Used only for Refiner (makes it 7-dim)
+        negative_aesthetic_score: Optional[float] = None, # Used only for Refiner's negative aesthetic
         dtype: torch.dtype = torch.float32,
         batch_size: int = 1,
         do_classifier_free_guidance: bool = True
     ) -> torch.Tensor:
         """
-        Generates `add_time_ids` for SDXL UNet conditioning.
-        For Base UNet: 6-dim tensor (spatial info only).
-        For Refiner UNet: 7-dim tensor (spatial info + aesthetic score).
+        Generates `add_time_ids` for SDXL UNet conditioning, mirroring `diffusers`' logic.
+
+        For Base UNet: Returns a 2x6 tensor (original_size, crops_coords, target_size).
+        For Refiner UNet: Returns a 2x7 tensor (original_size, crops_coords, target_size, aesthetic_score).
+        The first row is for negative prompt, second for positive.
         """
         add_time_ids_list = list(original_size + crops_coords_top_left + target_size)
         
-        # If aesthetic_score is provided, it's for the Refiner, so append it.
-        # Otherwise, it's for the Base, keep it 6-dim.
-        if aesthetic_score is not None:
-            # We assume a default positive aesthetic score for the conditional path
-            # and a typical negative aesthetic score for the unconditional path in CFG.
-            # These are typically hardcoded within the diffusers refiner pipeline for its _get_add_time_ids
-            # A common negative score for refiner is 2.5, positive is 6.0
-            negative_aesthetic_score = 2.5 # Default typical negative aesthetic score for refiner
-            # For CFG, we'll need both positive and negative versions if aesthetic_score is applicable
-            # However, for _get_add_time_ids, we just need the single value to construct the 7-dim vector.
-            # The CFG duplication happens later.
-            
-            # This is how diffusers pipeline handles the aesthetic score for the 7-dim time_ids
-            add_time_ids_pos = torch.tensor(add_time_ids_list + [aesthetic_score], device=self._target_device, dtype=dtype)
-            add_time_ids_neg = torch.tensor(add_time_ids_list + [negative_aesthetic_score], device=self._target_device, dtype=dtype)
-            
-            if do_classifier_free_guidance:
-                add_time_ids = torch.cat([add_time_ids_neg, add_time_ids_pos], dim=0)
-            else:
-                add_time_ids = add_time_ids_pos
-            
-            # Repeat for batch size
-            add_time_ids = add_time_ids.repeat(batch_size, 1) if batch_size > 1 else add_time_ids.unsqueeze(0)
+        add_time_ids_pos = torch.tensor([add_time_ids_list], device=self._target_device, dtype=dtype)
+        
+        # If aesthetic_score is provided, it's for the Refiner, so we append it
+        # and create both positive and negative aesthetic tensors.
+        if aesthetic_score is not None and negative_aesthetic_score is not None:
+            add_time_ids_pos = torch.cat([add_time_ids_pos, torch.tensor([[aesthetic_score]], device=self._target_device, dtype=dtype)], dim=-1)
+            add_time_ids_neg = torch.cat([torch.tensor([add_time_ids_list], device=self._target_device, dtype=dtype), torch.tensor([[negative_aesthetic_score]], device=self._target_device, dtype=dtype)], dim=-1)
+        else: # For Base, no aesthetic score in time_ids. Negative time_ids are same as positive.
+            add_time_ids_neg = add_time_ids_pos.clone()
 
-        else: # For Base UNet, no aesthetic score in time_ids
-            add_time_ids = torch.tensor(add_time_ids_list, device=self._target_device, dtype=dtype)
-            if do_classifier_free_guidance:
-                add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0) # Duplicate for CFG
-            
-            # Repeat for batch size
-            add_time_ids = add_time_ids.repeat(batch_size, 1) if batch_size > 1 else add_time_ids.unsqueeze(0)
+        if do_classifier_free_guidance:
+            # Concatenate for batch processing (unconditional + conditional)
+            final_add_time_ids = torch.cat([add_time_ids_neg, add_time_ids_pos], dim=0)
+        else:
+            final_add_time_ids = add_time_ids_pos
 
-        return add_time_ids
+        # Repeat for the actual batch_size (number of images generated)
+        final_add_time_ids = final_add_time_ids.repeat(batch_size, 1) if batch_size > 1 else final_add_time_ids
+
+        return final_add_time_ids
 
 
     @torch.no_grad() # Ensure no gradients are computed for the entire __call__ method unless explicitly enabled (e.g., for Gloss)
@@ -239,11 +229,11 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         callback_on_step_end: Optional[Callable] = None, # Callback for each denoising step
         callback_on_step_end_kwargs_base: Optional[Dict[str, Any]] = None, # Extra kwargs for base callback
         callback_on_step_end_kwargs_refiner: Optional[Dict[str, Any]] = None, # Extra kwargs for refiner callback
-        gloss_calculator: Optional[GlossCalculator] = None, # Instance of GlossCalculator
+        gloss_calculator: Optional[Any] = None, # Using Any to avoid import issues if not defined
         gloss_target: Optional[str] = None, # Target string for Gloss
         gloss_strength: float = 0.0, # Strength of Gloss guidance
         gloss_gradient_clip_norm: float = 1.0, # Gradient clipping for Gloss
-        gloss_active_start_step: int = 0, # Step from which Gloss becomes active
+        gloss_active_start_step: int = 0, # Step from which Gloss becomes active (shared for base/refiner)
         output_type: str = "pil", # "pil" for PIL Image, "np" for numpy array, "pt" for torch tensor
         aesthetic_score_refiner_pos: float = 6.0, # Positive aesthetic score for refiner's time_ids
         aesthetic_score_refiner_neg: float = 2.5, # Negative aesthetic score for refiner's time_ids
@@ -257,10 +247,11 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # Set Gloss target if a calculator is provided
         if gloss_calculator:
             if gloss_target is None:
-                raise ValueError("gloss_target must be provided if gloss_calculator is enabled.")
+                raise ValueError("`gloss_target` must be provided if `gloss_calculator` is enabled.")
             gloss_calculator.set_target(gloss_target)
 
         # 1. Prompt Encoding
+        print("Encoding prompts for Base and Refiner models...")
         # Encode prompts for the Base pipeline
         prompt_embeds_b, neg_p_embeds_b, pooled_embeds_b, neg_pooled_embeds_b = self._encode_prompt_helper(
             self.text_encoder_base, self.tokenizer_base,
@@ -269,12 +260,14 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             prompt, negative_prompt
         )
         # Encode prompts for the Refiner pipeline
+        # Note: text_encoder and tokenizer are None as refiner only uses text_encoder_2
         prompt_embeds_r, neg_p_embeds_r, pooled_embeds_r, neg_pooled_embeds_r = self._encode_prompt_helper(
-            None, None, # text_encoder_1 and its tokenizer are not used by the refiner's prompt encoding
+            None, None,
             self.text_encoder_refiner, self.tokenizer_refiner,
             self.unet_refiner, self.scheduler_refiner,
             prompt, negative_prompt
         )
+        print("Prompt encoding complete.")
 
         # 2. Latent & Timestep Preparation
         generator = torch.Generator(device=self._target_device).manual_seed(seed)
@@ -284,7 +277,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             device=self._target_device,
             dtype=self.vae.dtype
         )
-        latents *= self.scheduler_base.init_noise_sigma
+        latents *= self.scheduler_base.init_noise_sigma # Scale latents by initial noise sigma
 
         # 3. Base Denoising Loop
         self.scheduler_base.set_timesteps(num_inference_steps_base, device=self._target_device)
@@ -293,16 +286,16 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         base_denoise_end_step = int(num_inference_steps_base * denoising_end)
 
         # Prepare conditioning for the Base UNet for Classifier-Free Guidance (CFG)
-        prompt_embeds_b_cfg = torch.cat([neg_p_embeds_b, prompt_embeds_b], dim=0)
+        prompt_embeds_b_cfg = torch.cat([neg_p_embeds_b, prompt_embeds_b], dim=0) # Concatenate uncond and cond
         add_text_embeds_b_cfg = torch.cat([neg_pooled_embeds_b, pooled_embeds_b], dim=0)
 
-        # Get 6-dim time_ids for Base UNet (spatial info only)
-        # Note: aesthetic_score is None as it's not part of base's time_ids
+        # Get 6-dim time_ids for Base UNet (spatial info only, no aesthetic score)
         add_time_ids_base = self._get_add_time_ids(
             original_size=(height, width),
             crops_coords_top_left=(0, 0),
             target_size=(height, width),
-            aesthetic_score=None, # Important: None for base
+            aesthetic_score=None, # Explicitly None for Base
+            negative_aesthetic_score=None, # Explicitly None for Base
             dtype=self.torch_dtype,
             batch_size=batch_size,
             do_classifier_free_guidance=True
@@ -315,72 +308,96 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         final_cb_kwargs_base = {**(callback_on_step_end_kwargs_base or {}), 'vae': self.vae}
 
         print(f"Starting Base Denoising Loop ({base_denoise_end_step} steps)...")
-        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step])):
+        # Use self.progress_bar for consistent progress bar display
+        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step], desc="Base Denoising")):
+            # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_base.scale_model_input(latent_model_input, t)
             
             is_gloss_active = gloss_calculator and i >= gloss_active_start_step and gloss_strength > 0
             if is_gloss_active:
-                latents.requires_grad_(True)
+                latents.requires_grad_(True) # Enable gradients for Gloss calculation
 
+            # UNet prediction for base model
             noise_pred = self.unet_base(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds_b_cfg,
-                added_cond_kwargs=final_added_cond_kwargs_base
-            ).sample
-            
-            if is_gloss_active:
-                 latents.requires_grad_(False)
+                added_cond_kwargs=final_added_cond_kwargs_base,
+            ).sample # Access the 'sample' attribute from UNetOutput
 
+            if is_gloss_active:
+                 latents.requires_grad_(False) # Disable gradients after UNet call
+
+            # Perform Classifier-Free Guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
             guided_noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+            # Apply Gloss if active
             if is_gloss_active:
-                with torch.enable_grad():
+                with torch.enable_grad(): # Re-enable gradients for the Gloss calculation
                      latents.requires_grad_(True)
                      gloss_grad = gloss_calculator.calculate_gloss_gradient(
-                         latents, guided_noise_pred, t, self.scheduler_base, self.vae, gloss_strength, gloss_gradient_clip_norm)
-                     latents.requires_grad_(False)
-                latents = latents.detach() - gloss_grad
+                         latents=latents,
+                         noise_pred=guided_noise_pred, # Use the guided noise pred
+                         current_timestep=t,
+                         scheduler=self.scheduler_base,
+                         vae_decoder=self.vae,
+                         gloss_strength=gloss_strength,
+                         gradient_clip_norm=gloss_gradient_clip_norm
+                     )
+                     latents.requires_grad_(False) # Disable gradients again after Gloss
+                latents = latents.detach() - gloss_grad # Apply gradient update
+            else:
+                latents = latents.detach() # Ensure latents are detached if Gloss is not active
 
-            latents = self.scheduler_base.step(guided_noise_pred, t, latents).prev_sample
+            # Scheduler step to denoise latents
+            latents = self.scheduler_base.step(guided_noise_pred, t, latents, generator=generator).prev_sample
 
+            # Callback on step end
             if callback_on_step_end:
                 new_guidance_scale = callback_on_step_end(
                     step=i, timestep=int(t), latents=latents,
                     current_guidance_scale=current_guidance_scale, callback_kwargs=final_cb_kwargs_base)
                 if new_guidance_scale is not None:
-                    current_guidance_scale = new_guidance_scale
+                    current_guidance_scale = new_guidance_scale # Update guidance scale if callback returns one
+
+        print("Base Denoising Loop finished.")
 
         # 4. Refiner Denoising Loop
         self.scheduler_refiner.set_timesteps(num_inference_steps_refiner, device=self._target_device)
-        refiner_start_idx = int(num_inference_steps_refiner * (1 - denoising_start))
-        timesteps_refiner = self.scheduler_refiner.timesteps[refiner_start_idx:]
-        
+        # Determine the start timestep for the refiner based on denoising_start
+        refiner_start_timestep_idx = int(len(self.scheduler_refiner.timesteps) * (1 - denoising_start))
+        timesteps_refiner = self.scheduler_refiner.timesteps[refiner_start_timestep_idx:]
+
+        # Prepare conditioning for the Refiner UNet for Classifier-Free Guidance (CFG)
         prompt_embeds_r_cfg = torch.cat([neg_p_embeds_r, prompt_embeds_r], dim=0)
         add_text_embeds_r_cfg = torch.cat([neg_pooled_embeds_r, pooled_embeds_r], dim=0)
 
         # Get 7-dim time_ids for Refiner UNet (spatial info + aesthetic score)
+        # This is CRUCIAL for the Refiner.
         add_time_ids_refiner = self._get_add_time_ids(
             original_size=(height, width),
             crops_coords_top_left=(0, 0),
             target_size=(height, width),
             aesthetic_score=aesthetic_score_refiner_pos, # Pass positive aesthetic score
+            negative_aesthetic_score=aesthetic_score_refiner_neg, # Pass negative aesthetic score
             dtype=self.torch_dtype,
             batch_size=batch_size,
             do_classifier_free_guidance=True
         )
 
-        # Final `added_cond_kwargs` for refiner: text_embeds AND 7-dim time_ids
+        # Final `added_cond_kwargs` for refiner: ONLY `text_embeds` and `time_ids` (7-dim)
+        # Do NOT add a separate "aesthetic_score" key here. The UNet handles its internal projection.
         final_added_cond_kwargs_refiner = {
             "text_embeds": add_text_embeds_r_cfg,
-            "time_ids": add_time_ids_refiner
+            "time_ids": add_time_ids_refiner # This 2x7 tensor already includes aesthetic scores
         }
         final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
         print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...")
-        for i, t in enumerate(self.progress_bar(timesteps_refiner)):
+        for i, t in enumerate(self.progress_bar(timesteps_refiner, desc="Refiner Denoising")):
+            # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
             
@@ -389,48 +406,64 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             if is_gloss_active:
                 latents.requires_grad_(True)
 
+            # UNet prediction for refiner model
             noise_pred = self.unet_refiner(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds_r_cfg,
-                added_cond_kwargs=final_added_cond_kwargs_refiner
-            ).sample
-            
+                added_cond_kwargs=final_added_cond_kwargs_refiner,
+            ).sample # Access the 'sample' attribute from UNetOutput
+
             if is_gloss_active:
                  latents.requires_grad_(False)
 
+            # Perform Classifier-Free Guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
             guided_noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred_text - noise_pred_uncond)
-            
+
+            # Apply Gloss if active
             if is_gloss_active:
                 with torch.enable_grad():
                     latents.requires_grad_(True)
                     gloss_grad = gloss_calculator.calculate_gloss_gradient(
-                        latents, guided_noise_pred, t, self.scheduler_refiner, self.vae, gloss_strength, gloss_gradient_clip_norm)
+                        latents=latents,
+                        noise_pred=guided_noise_pred,
+                        current_timestep=t,
+                        scheduler=self.scheduler_refiner,
+                        vae_decoder=self.vae,
+                        gloss_strength=gloss_strength,
+                        gradient_clip_norm=gloss_gradient_clip_norm
+                    )
                     latents.requires_grad_(False)
                 latents = latents.detach() - gloss_grad
+            else:
+                latents = latents.detach()
 
-            latents = self.scheduler_refiner.step(guided_noise_pred, t, latents).prev_sample
+            # Scheduler step to denoise latents
+            latents = self.scheduler_refiner.step(guided_noise_pred, t, latents, generator=generator).prev_sample
             
+            # Callback on step end
             if callback_on_step_end:
                 new_guidance_scale = callback_on_step_end(
-                    step=i + base_denoise_end_step,
+                    step=i + base_denoise_end_step, # Ensure global step count is passed
                     timestep=int(t), latents=latents,
                     current_guidance_scale=current_guidance_scale, callback_kwargs=final_cb_kwargs_refiner)
                 if new_guidance_scale is not None:
                     current_guidance_scale = new_guidance_scale
 
+        print("Refiner Denoising Loop finished.")
+
         # 5. VAE Decoding
+        print("Decoding latents to image...")
         image = self.vae.decode(latents / self.vae.config.scaling_factor).sample
-        # Assuming `self.image_processor` from a parent `DiffusionPipeline` or similar
-        # If not present, you'll need a manual post-processing step here or import `VaeImageProcessor`
-        # For now, let's assume it exists or fallback to direct PIL conversion
         
-        # Fallback if image_processor is not automatically set up by inheriting DiffusionPipeline
+        # Post-processing using Diffusers' VaeImageProcessor
+        # Initialize if not already present (e.g., if DiffusionPipeline init doesn't set it)
         if not hasattr(self, 'image_processor') or self.image_processor is None:
             from diffusers.image_processor import VaeImageProcessor
             self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae.config.scaling_factor)
 
         image = self.image_processor.postprocess(image, output_type=output_type)
+        print("Image decoding complete.")
         
         return {"images": image}
