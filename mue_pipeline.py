@@ -1,13 +1,12 @@
-# File: mue_pipeline.py (Corrected)
-
 import torch
 from PIL import Image
 from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline, StableDiffusionXLRefinerPipeline
+# CORRECTED IMPORT: Import directly from diffusers top-level package
+from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline # Using Img2Img for Refiner
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple
 
-from dis_module import DISCalculator
-from gloss_module import GlossCalculator
+from dis_module import DISCalculator # Assuming these modules exist
+from gloss_module import GlossCalculator # Assuming these modules exist
 
 class MUEDiffusionPipeline(DiffusionPipeline):
     """
@@ -33,7 +32,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         del pipe_base
 
         # Load Refiner components efficiently
-        pipe_refiner = StableDiffusionXLRefinerPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
+        # Use StableDiffusionXLImg2ImgPipeline for refiner as it's the more common and suitable base class
+        pipe_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
         self.unet_refiner = pipe_refiner.unet.to(self.device)
         self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self.device) # Refiner only has text_encoder_2
         self.tokenizer_refiner = pipe_refiner.tokenizer_2 # Refiner only has tokenizer_2
@@ -72,7 +72,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     def _encode_refiner_prompt(self, prompt, negative_prompt) -> Tuple[torch.Tensor, torch.Tensor]:
         """ [FIXED] Correctly encodes prompts for the SDXL Refiner model. """
         # The refiner uses a different pipeline and only text_encoder_2
-        temp_pipe = StableDiffusionXLRefinerPipeline(
+        # Use StableDiffusionXLImg2ImgPipeline to access its encode_prompt method
+        temp_pipe = StableDiffusionXLImg2ImgPipeline( # Changed to StableDiffusionXLImg2ImgPipeline
             vae=self.vae, text_encoder_2=self.text_encoder_refiner, tokenizer_2=self.tokenizer_refiner,
             unet=self.unet_refiner, scheduler=self.scheduler_refiner
         )
