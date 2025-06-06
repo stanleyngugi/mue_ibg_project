@@ -19,15 +19,17 @@ if __name__ == "__main__":
     # Initialize our custom MUE pipeline
     start_init_time = time.time()
     try:
+        # CORRECTED: Remove 'variant', 'use_safetensors', and 'low_cpu_mem_usage'
+        # These are handled internally by MUEDiffusionPipeline's __init__ method
         mue_pipe = MUEDiffusionPipeline(
             torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-            low_cpu_mem_usage=False,
-            device="cuda" if torch.cuda.is_available() else "cpu"
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            # Optional: Enable compilation if you want to test torch.compile, e.g., compile_models=True
+            compile_models=False # Set to True to enable torch.compile
         )
     except Exception as e:
         print(f"Error during pipeline initialization: {e}")
+        # This catch-all message is fine, as it provides useful general advice.
         print("Please ensure you have sufficient VRAM and have run 'huggingface-cli login'.")
         exit()
         
