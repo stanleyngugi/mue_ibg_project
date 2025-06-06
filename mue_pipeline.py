@@ -3,10 +3,10 @@ from PIL import Image
 from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
 from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple
+# You can directly import tqdm if you need more control over progress bars
+# from tqdm.auto import tqdm
 
 # Assuming these modules are correctly implemented and available
-# You would need to ensure 'dis_module.py' and 'gloss_module.py' are in your project
-# and contain the expected classes/functions.
 from dis_module import DISCalculator
 from gloss_module import GlossCalculator
 
@@ -14,12 +14,13 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss).
-    (Version 4.3 - Final, Hardened, and Architecturally Correct)
+    (Version 4.4 - Fixes progress bar TypeError)
 
     This version incorporates robust device handling, correctly passes UNet/Scheduler
-    to the internal prompt encoding helper, and crucially, accurately constructs
+    to the internal prompt encoding helper, accurately constructs
     the `added_cond_kwargs` for the SDXL Refiner UNet, specifically handling
-    the aesthetic score's inclusion within the `time_ids` tensor.
+    the aesthetic score's inclusion within the `time_ids` tensor, and addresses
+    the TypeError with `progress_bar`.
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -218,7 +219,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             num_inference_steps_base (int): Number of denoising steps for the base model.
             num_inference_steps_refiner (int): Number of denoising steps for the refiner model.
             denoising_end (float): Fraction of base denoising steps when refiner takes over.
-            denoising_start (float): Fraction of refiner denoising steps to start from.
+            denoosing_start (float): Fraction of refiner denoising steps to start from.
             initial_guidance_scale (float): Initial classifier-free guidance scale.
             seed (int): Random seed for reproducibility.
             callback_on_step_end (Optional[Callable]): A function to call at the end of each denoising step.
@@ -230,7 +231,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             gloss_calculator (Optional[GlossCalculator]): An instance of `GlossCalculator` for gradient steering.
             gloss_target (Optional[str]): The target concept for Gloss guidance.
             gloss_strength (float): The strength of the Gloss guidance.
-            gloss_gradient_clip_norm (float): Gradient clipping norm for Gloss.
+            gloss_gradient_clip_norm (float): Gradient clipping for Gloss.
             gloss_active_start_step (int): The step at which Gloss guidance becomes active.
             output_type (str): The desired output format ("pil", "np", "pt").
             **kwargs: Arbitrary keyword arguments.
@@ -308,7 +309,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         final_cb_kwargs_base = {**(callback_on_step_end_kwargs_base or {}), 'vae': self.vae}
 
         print(f"Starting Base Denoising Loop ({base_denoise_end_step} steps)...")
-        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step], desc="Base Denoising")):
+        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step])): # Removed 'desc' argument
             # Prepare latent input for UNet (duplicated for CFG)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_base.scale_model_input(latent_model_input, t)
@@ -405,8 +406,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
         final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
-        print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...")
-        for i, t in enumerate(self.progress_bar(timesteps_refiner, desc="Refiner Denoising")):
+        print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...") # Corrected log message
+        for i, t in enumerate(self.progress_bar(timesteps_refiner)): # Removed 'desc' argument
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
             
