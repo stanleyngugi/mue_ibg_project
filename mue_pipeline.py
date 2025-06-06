@@ -13,14 +13,14 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss).
-    (Version 4.5 - Re-re-fixes Refiner added_cond_kwargs based on UNet config.json)
+    (Version 4.6 - Final fix for Refiner added_cond_kwargs based on `2816` error and UNet expectations)
 
     This version incorporates robust device handling, correctly passes UNet/Scheduler
     to the internal prompt encoding helper, and now correctly constructs
     the `added_cond_kwargs` for the SDXL Refiner UNet. This fix assumes
-    the refiner UNet expects `text_embeds`, `time_ids` (spatial only),
-    AND `aesthetic_score` as separate keys within `added_cond_kwargs`,
-    as indicated by its `config.json`'s `addition_embed_type`.
+    the refiner UNet expects `text_embeds` (pooled output) and `time_ids`
+    (which bundles spatial info AND aesthetic score as a 7-dim tensor),
+    aligning with its `addition_embed_type_output_features: 2560` and eliminating the `2816` error.
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -226,7 +226,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
                 It can modify `current_guidance_scale`.
             callback_on_step_end_kwargs_base (Optional[Dict[str, Any]]): Additional keyword arguments
                 to pass to the callback during base denoising.
-            callback_on_step_end_kwargs_refiner (Optional[Dict[str, Any]]): Additional keyword arguments
+            callback_on_step_end_kwargs_refiner (Optional[str, Any]]): Additional keyword arguments
                 to pass to the callback during refiner denoising.
             gloss_calculator (Optional[GlossCalculator]): An instance of `GlossCalculator` for gradient steering.
             gloss_target (Optional[str]): The target concept for Gloss guidance.
@@ -369,32 +369,36 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # Its shape is (2*batch_size, sequence_length, 1280)
         prompt_embeds_r_cfg = torch.cat([neg_p_embeds_r, prompt_embeds_r], dim=0)
 
-        # --- REFINER'S `added_cond_kwargs` (CRITICAL FIX) ---
-        # Based on refiner UNet config.json: `"addition_embed_type": "text_time_ids_and_aesthetic_score"`
-        # This means the UNet expects `text_embeds`, `time_ids` (spatial only), and `aesthetic_score` separately.
+        # --- REFINER'S `added_cond_kwargs` (FIXED AGAIN) ---
+        # Based on detailed analysis, the refiner's UNet expects:
+        # 1. `text_embeds`: Pooled output from text_encoder_2 (1280-dim)
+        # 2. `time_ids`: Combined spatial info (6-dim) AND aesthetic score (1-dim) as a single 7-dim tensor.
+        #    This 7-dim tensor is projected to 1280 by `add_time_proj` internally.
+        # This yields total input to add_embedding.linear_1 of 1280 + 1280 = 2560.
 
         # 1. `text_embeds`: Pooled output from text_encoder_2 (1280-dim)
         add_text_embeds_r_cfg = torch.cat([neg_pooled_embeds_r, pooled_embeds_r], dim=0) # Shape: (2*batch, 1280)
 
-        # 2. `time_ids`: Spatial information only (6-dim)
+        # 2. `time_ids`: Spatial information (6-dim) + Aesthetic score (1-dim) = 7-dim
         original_size_r = torch.tensor([[height, width]], device=self._target_device, dtype=self.torch_dtype)
         crops_coords_top_left_r = torch.tensor([[0, 0]], device=self._target_device, dtype=self.torch_dtype)
         target_size_r = torch.tensor([[height, width]], device=self._target_device, dtype=self.torch_dtype)
         
-        # Combine spatial info for `time_ids` (6-dim)
-        add_time_ids_r = torch.cat([original_size_r, crops_coords_top_left_r, target_size_r], dim=-1).repeat(batch_size, 1) # Shape: (batch, 6)
-        add_time_ids_r_cfg = torch.cat([add_time_ids_r, add_time_ids_r], dim=0) # Duplicate for CFG, Shape: (2*batch, 6)
+        # Aesthetic score (combined with time_ids)
+        aesthetic_score_pos = torch.tensor([[6.0]], device=self._target_device, dtype=self.torch_dtype)
+        aesthetic_score_neg = torch.tensor([[2.5]], device=self._target_device, dtype=self.torch_dtype)
+        
+        # Concatenate spatial info + aesthetic score for the 7-dim time_ids
+        add_time_ids_r_pos = torch.cat([original_size_r, crops_coords_top_left_r, target_size_r, aesthetic_score_pos], dim=-1).repeat(batch_size, 1) # Shape: (batch, 7)
+        add_time_ids_r_neg = torch.cat([original_size_r, crops_coords_top_left_r, target_size_r, aesthetic_score_neg], dim=-1).repeat(batch_size, 1) # Shape: (batch, 7)
+        
+        add_time_ids_r_cfg = torch.cat([add_time_ids_r_neg, add_time_ids_r_pos], dim=0) # Shape: (2*batch, 7)
 
-        # 3. `aesthetic_score`: Separate 1-dim tensor
-        aesthetic_score_pos = torch.tensor([[6.0]], device=self._target_device, dtype=self.torch_dtype).repeat(batch_size, 1)
-        aesthetic_score_neg = torch.tensor([[2.5]], device=self._target_device, dtype=self.torch_dtype).repeat(batch_size, 1)
-        add_aesthetic_embeds_r_cfg = torch.cat([aesthetic_score_neg, aesthetic_score_pos], dim=0) # Shape: (2*batch, 1)
-
-        # Final `added_cond_kwargs` for refiner, with separate aesthetic_score
+        # Final `added_cond_kwargs` for refiner: ONLY `text_embeds` and `time_ids` (7-dim combined)
         final_added_cond_kwargs_refiner = {
             "text_embeds": add_text_embeds_r_cfg,        # (2*batch, 1280)
-            "time_ids": add_time_ids_r_cfg,              # (2*batch, 6)
-            "aesthetic_score": add_aesthetic_embeds_r_cfg # (2*batch, 1)
+            "time_ids": add_time_ids_r_cfg               # (2*batch, 7)
+            # IMPORTANT: NO "aesthetic_score" key here, as it's bundled in time_ids for the refiner
         }
         # --- END REFINER'S `added_cond_kwargs` FIX ---
 
