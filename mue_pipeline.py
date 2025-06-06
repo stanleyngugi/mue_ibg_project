@@ -16,16 +16,18 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         super().__init__()
-        self.device = device
+        # CRITICAL FIX: Renamed 'self.device' to 'self._target_device' to avoid conflict
+        # with the DiffusionPipeline base class's internal 'device' property.
+        self._target_device = device
         self.torch_dtype = torch_dtype
         model_loading_kwargs = {"torch_dtype": self.torch_dtype, "variant": "fp16", "use_safetensors": True}
 
         print("Initializing MUEDiffusionPipeline with efficient component loading...")
         # Load Base components efficiently
         pipe_base = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", **model_loading_kwargs)
-        self.unet_base = pipe_base.unet.to(self.device)
-        self.text_encoder_base = pipe_base.text_encoder.to(self.device)
-        self.text_encoder_2_base = pipe_base.text_encoder_2.to(self.device)
+        self.unet_base = pipe_base.unet.to(self._target_device) # Using _target_device
+        self.text_encoder_base = pipe_base.text_encoder.to(self._target_device) # Using _target_device
+        self.text_encoder_2_base = pipe_base.text_encoder_2.to(self._target_device) # Using _target_device
         self.tokenizer_base = pipe_base.tokenizer
         self.tokenizer_2_base = pipe_base.tokenizer_2
         self.scheduler_base = DPMSolverMultistepScheduler.from_config(pipe_base.scheduler.config, use_karras_sigmas=True)
@@ -34,14 +36,14 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # Load Refiner components efficiently
         # Use StableDiffusionXLImg2ImgPipeline for refiner as it's the more common and suitable base class
         pipe_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
-        self.unet_refiner = pipe_refiner.unet.to(self.device)
-        self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self.device) # Refiner only has text_encoder_2
+        self.unet_refiner = pipe_refiner.unet.to(self._target_device) # Using _target_device
+        self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self._target_device) # Using _target_device
         self.tokenizer_refiner = pipe_refiner.tokenizer_2 # Refiner only has tokenizer_2
         self.scheduler_refiner = DPMSolverMultistepScheduler.from_config(pipe_refiner.scheduler.config, use_karras_sigmas=True)
         del pipe_refiner
 
         # Shared VAE
-        self.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=self.torch_dtype).to(self.device)
+        self.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=self.torch_dtype).to(self._target_device) # Using _target_device
 
         if compile_models:
             print("Compiling UNets, VAE, and Text Encoders with torch.compile...")
@@ -64,21 +66,23 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             tokenizer=self.tokenizer_base, tokenizer_2=self.tokenizer_2_base, unet=self.unet_base,
             scheduler=self.scheduler_base
         )
+        # Using _target_device for `device` argument
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = \
-            temp_pipe.encode_prompt(prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=negative_prompt)
+            temp_pipe.encode_prompt(prompt, device=self._target_device, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=negative_prompt)
         del temp_pipe
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
     def _encode_refiner_prompt(self, prompt, negative_prompt) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ [FIXED] Correctly encodes prompts for the SDXL Refiner model. """
+        """ Correctly encodes prompts for the SDXL Refiner model. """
         # The refiner uses a different pipeline and only text_encoder_2
         # Use StableDiffusionXLImg2ImgPipeline to access its encode_prompt method
-        temp_pipe = StableDiffusionXLImg2ImgPipeline( # Changed to StableDiffusionXLImg2ImgPipeline
+        temp_pipe = StableDiffusionXLImg2ImgPipeline(
             vae=self.vae, text_encoder_2=self.text_encoder_refiner, tokenizer_2=self.tokenizer_refiner,
             unet=self.unet_refiner, scheduler=self.scheduler_refiner
         )
+        # Using _target_device for `device` argument
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = \
-            temp_pipe.encode_prompt(prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=negative_prompt)
+            temp_pipe.encode_prompt(prompt, device=self._target_device, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=negative_prompt)
         
         # The refiner pipeline concatenates the embeds for us, so we can use them directly.
         # It combines the prompt_embeds and pooled_prompt_embeds into a single tensor.
@@ -90,14 +94,16 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
 
     def _prepare_added_cond_kwargs_base(self, height, width, batch_size):
-        add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=self.device, dtype=self.torch_dtype)
+        # Using _target_device for tensor creation
+        add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=self._target_device, dtype=self.torch_dtype)
         return {"add_time_ids": add_time_ids.repeat(batch_size * 1, 1)}
 
     def _prepare_added_cond_kwargs_refiner(self, height, width, batch_size):
         # Refiner uses different default values for aesthetic score
-        add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=self.device, dtype=self.torch_dtype)
+        # Using _target_device for tensor creation
+        add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=self._target_device, dtype=self.torch_dtype)
         # Refiner's aesthetic embedding
-        add_aesthetic_embeds = torch.tensor([[2.5, 2.5, 2.5, 2.5, 2.5, 2.5]], device=self.device, dtype=self.torch_dtype)
+        add_aesthetic_embeds = torch.tensor([[2.5, 2.5, 2.5, 2.5, 2.5, 2.5]], device=self._target_device, dtype=self.torch_dtype)
         
         return {"add_time_ids": add_time_ids.repeat(batch_size, 1), "add_aesthetic_embeds": add_aesthetic_embeds.repeat(batch_size, 1)}
 
@@ -137,12 +143,14 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         prompt_embeds_r, neg_p_embeds_r = self._encode_refiner_prompt(prompt, negative_prompt)
 
         # 2. Latent & Timestep Preparation
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        latents = torch.randn((batch_size, 4, height // 8, width // 8), generator=generator, device=self.device, dtype=self.vae.dtype)
+        # Using _target_device for generator and latents
+        generator = torch.Generator(device=self._target_device).manual_seed(seed)
+        latents = torch.randn((batch_size, 4, height // 8, width // 8), generator=generator, device=self._target_device, dtype=self.vae.dtype)
         latents = latents * self.scheduler_base.init_noise_sigma
 
         # 3. Base Denoising Loop
-        self.scheduler_base.set_timesteps(num_inference_steps_base, device=self.device)
+        # Ensuring scheduler timesteps are on the correct device
+        self.scheduler_base.set_timesteps(num_inference_steps_base, device=self._target_device) # Using _target_device
         timesteps_base = self.scheduler_base.timesteps
         current_guidance_scale = initial_guidance_scale
         base_denoise_end_step = int(num_inference_steps_base * denoising_end)
@@ -197,13 +205,13 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
 
         # 4. Refiner Denoising Loop
-        self.scheduler_refiner.set_timesteps(num_inference_steps_refiner, device=self.device)
+        # Ensuring scheduler timesteps are on the correct device
+        self.scheduler_refiner.set_timesteps(num_inference_steps_refiner, device=self._target_device) # Using _target_device
         timesteps_refiner = self.scheduler_refiner.timesteps[int(num_inference_steps_refiner * (1-denoising_start)):]
         
         prompt_embeds_r = torch.cat([neg_p_embeds_r, prompt_embeds_r])
         added_cond_kwargs_r = self._prepare_added_cond_kwargs_refiner(height, width, batch_size)
         
-        # [FIXED] Prepare kwargs for refiner callback
         final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
         for i, t in enumerate(self.progress_bar(timesteps_refiner)):
@@ -215,7 +223,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
             noise_pred = self.unet_refiner(
                 latent_model_input, t,
-                encoder_hidden_states=None, # Refiner passes embeddings through added_cond_kwargs
+                encoder_hidden_states=None,
                 added_cond_kwargs=added_cond_kwargs
             ).sample
             
@@ -223,7 +231,6 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             guided_noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred_text - noise_pred_uncond)
             latents = self.scheduler_refiner.step(guided_noise_pred, t, latents).prev_sample
             
-            # [FIXED] Add callback hook to refiner loop
             if callback_on_step_end:
                 new_guidance_scale = callback_on_step_end(
                     step=i + base_denoise_end_step, timestep=int(t), latents=latents,
