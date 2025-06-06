@@ -3,8 +3,7 @@ from PIL import Image
 from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
 from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple
-# You can directly import tqdm if you need more control over progress bars
-# from tqdm.auto import tqdm
+# from tqdm.auto import tqdm # Keep this commented unless you need custom tqdm control
 
 # Assuming these modules are correctly implemented and available
 from dis_module import DISCalculator
@@ -14,13 +13,14 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss).
-    (Version 4.4 - Fixes progress bar TypeError)
+    (Version 4.5 - Re-re-fixes Refiner added_cond_kwargs based on UNet config.json)
 
     This version incorporates robust device handling, correctly passes UNet/Scheduler
-    to the internal prompt encoding helper, accurately constructs
-    the `added_cond_kwargs` for the SDXL Refiner UNet, specifically handling
-    the aesthetic score's inclusion within the `time_ids` tensor, and addresses
-    the TypeError with `progress_bar`.
+    to the internal prompt encoding helper, and now correctly constructs
+    the `added_cond_kwargs` for the SDXL Refiner UNet. This fix assumes
+    the refiner UNet expects `text_embeds`, `time_ids` (spatial only),
+    AND `aesthetic_score` as separate keys within `added_cond_kwargs`,
+    as indicated by its `config.json`'s `addition_embed_type`.
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -370,43 +370,37 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         prompt_embeds_r_cfg = torch.cat([neg_p_embeds_r, prompt_embeds_r], dim=0)
 
         # --- REFINER'S `added_cond_kwargs` (CRITICAL FIX) ---
-        # Refiner's `added_cond_kwargs` requires `text_embeds` (pooled output from text_encoder_2)
-        # and `time_ids`. Crucially, for the refiner, the `aesthetic_score` is CONCATENATED
-        # directly into the `time_ids` tensor, making it 7-dimensional.
-        
-        # 1. `text_embeds`: This is the pooled output from text_encoder_2
-        add_text_embeds_r_cfg = torch.cat([neg_pooled_embeds_r, pooled_embeds_r], dim=0) # Shape: (2*batch_size, 1280)
+        # Based on refiner UNet config.json: `"addition_embed_type": "text_time_ids_and_aesthetic_score"`
+        # This means the UNet expects `text_embeds`, `time_ids` (spatial only), and `aesthetic_score` separately.
 
-        # 2. `time_ids`: This must be a 7-dimensional tensor.
-        # It consists of [original_height, original_width, crop_top, crop_left, target_height, target_width, aesthetic_score]
+        # 1. `text_embeds`: Pooled output from text_encoder_2 (1280-dim)
+        add_text_embeds_r_cfg = torch.cat([neg_pooled_embeds_r, pooled_embeds_r], dim=0) # Shape: (2*batch, 1280)
+
+        # 2. `time_ids`: Spatial information only (6-dim)
         original_size_r = torch.tensor([[height, width]], device=self._target_device, dtype=self.torch_dtype)
         crops_coords_top_left_r = torch.tensor([[0, 0]], device=self._target_device, dtype=self.torch_dtype)
         target_size_r = torch.tensor([[height, width]], device=self._target_device, dtype=self.torch_dtype)
         
-        # Default aesthetic scores for refiner (can be made configurable if needed)
-        # Positive aesthetic score for positive prompt, negative for negative prompt
-        aesthetic_score_pos = torch.tensor([[6.0]], device=self._target_device, dtype=self.torch_dtype)
-        aesthetic_score_neg = torch.tensor([[2.5]], device=self._target_device, dtype=self.torch_dtype) # Lower aesthetic score for negative
+        # Combine spatial info for `time_ids` (6-dim)
+        add_time_ids_r = torch.cat([original_size_r, crops_coords_top_left_r, target_size_r], dim=-1).repeat(batch_size, 1) # Shape: (batch, 6)
+        add_time_ids_r_cfg = torch.cat([add_time_ids_r, add_time_ids_r], dim=0) # Duplicate for CFG, Shape: (2*batch, 6)
 
-        # Concatenate spatial info and aesthetic score for `time_ids`
-        # Create a single `time_ids` entry for positive and negative prompts
-        add_time_ids_r_pos = torch.cat([original_size_r, crops_coords_top_left_r, target_size_r, aesthetic_score_pos], dim=-1).repeat(batch_size, 1) # Shape: (batch_size, 7)
-        add_time_ids_r_neg = torch.cat([original_size_r, crops_coords_top_left_r, target_size_r, aesthetic_score_neg], dim=-1).repeat(batch_size, 1) # Shape: (batch_size, 7)
-        
-        # Combine for CFG (negative first, then positive)
-        add_time_ids_r_cfg = torch.cat([add_time_ids_r_neg, add_time_ids_r_pos], dim=0) # Shape: (2*batch_size, 7)
+        # 3. `aesthetic_score`: Separate 1-dim tensor
+        aesthetic_score_pos = torch.tensor([[6.0]], device=self._target_device, dtype=self.torch_dtype).repeat(batch_size, 1)
+        aesthetic_score_neg = torch.tensor([[2.5]], device=self._target_device, dtype=self.torch_dtype).repeat(batch_size, 1)
+        add_aesthetic_embeds_r_cfg = torch.cat([aesthetic_score_neg, aesthetic_score_pos], dim=0) # Shape: (2*batch, 1)
 
-        # The refiner's `added_cond_kwargs` structure (as per diffusers `StableDiffusionXLImg2ImgPipeline` source):
+        # Final `added_cond_kwargs` for refiner, with separate aesthetic_score
         final_added_cond_kwargs_refiner = {
-            "text_embeds": add_text_embeds_r_cfg, # Shape: (2*batch_size, 1280)
-            "time_ids": add_time_ids_r_cfg        # Shape: (2*batch_size, 7)
+            "text_embeds": add_text_embeds_r_cfg,        # (2*batch, 1280)
+            "time_ids": add_time_ids_r_cfg,              # (2*batch, 6)
+            "aesthetic_score": add_aesthetic_embeds_r_cfg # (2*batch, 1)
         }
-        # Note: A separate "aesthetic_score" key is NOT used here; it's bundled into "time_ids".
         # --- END REFINER'S `added_cond_kwargs` FIX ---
 
         final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
-        print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...") # Corrected log message
+        print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...")
         for i, t in enumerate(self.progress_bar(timesteps_refiner)): # Removed 'desc' argument
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
