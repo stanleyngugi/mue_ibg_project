@@ -1,10 +1,13 @@
+# File: run_phase4.py (Corrected)
+
 import torch
 import time
 from mue_pipeline import MUEDiffusionPipeline
+from dis_module import DISCalculator   # [FIXED] Import DISCalculator
+from gloss_module import GlossCalculator # [FIXED] Import GlossCalculator
 from typing import Dict, Any
 
 # --- MUE Parameters ---
-# For Adaptive Lambda (DIS)
 MIN_GUIDANCE_SCALE = 4.0
 MAX_GUIDANCE_SCALE = 12.0
 DIS_STABLE_THRESHOLD = 0.002
@@ -12,41 +15,44 @@ DIS_UNSTABLE_THRESHOLD = 0.008
 LAMBDA_INCREASE_RATE = 0.5
 LAMBDA_DECREASE_RATE = 1.0
 
-# For Gradient Steering (Gloss)
 GLOSS_TARGET_CONCEPT = "sharp details, vibrant colors, clear focus, high contrast, photorealistic"
-GLOSS_STRENGTH = 0.08  # Scaled down as our gradient is now more accurate
+GLOSS_STRENGTH = 0.08
 GLOSS_GRADIENT_CLIP_NORM = 0.5
-GLOSS_ACTIVE_START_STEP = 5 # Start Gloss after the most chaotic initial steps
+GLOSS_ACTIVE_START_STEP = 5
 
 # --- 1. MUE Callback for DIS/Adaptive Lambda ---
 def mue_callback(step: int, timestep: int, latents: torch.Tensor, current_guidance_scale: float, callback_kwargs: Dict[str, Any]) -> float:
-    model_name = callback_kwargs.get("model_name", "Unknown Model")
-    dis_calculator = callback_kwargs.get("dis_calculator")
+    # This callback is now only for DIS, Gloss is handled by the pipeline directly
+    dis_calculator = callback_kwargs.get("dis_calculator_instance")
     vae = callback_kwargs.get("vae")
-    new_guidance_scale = current_guidance_scale
-
+    
     if dis_calculator and vae:
         dis_score = dis_calculator.calculate_dis(latents=latents, vae=vae)
-        print(f"[{model_name}] Step {step:02d} | DIS={dis_score:.5f} | In λ={current_guidance_scale:.2f}", end="")
+        print(f"[Base] Step {step:02d} | DIS={dis_score:.5f} | In λ={current_guidance_scale:.2f}", end="")
+        
         if dis_score < DIS_STABLE_THRESHOLD:
-            new_guidance_scale += LAMBDA_INCREASE_RATE
+            new_guidance_scale = current_guidance_scale + LAMBDA_INCREASE_RATE
             print(f" -> Stable, Out λ={new_guidance_scale:.2f}")
         elif dis_score > DIS_UNSTABLE_THRESHOLD:
-            new_guidance_scale -= LAMBDA_DECREASE_RATE
+            new_guidance_scale = current_guidance_scale - LAMBDA_DECREASE_RATE
             print(f" -> Unstable, Out λ={new_guidance_scale:.2f}")
         else:
             print(" -> Normal")
+        
         return max(MIN_GUIDANCE_SCALE, min(new_guidance_scale, MAX_GUIDANCE_SCALE))
+    
     return current_guidance_scale
 
 # --- 2. Main Execution Block ---
 if __name__ == "__main__":
     print("Starting Phase 4: Full MUE Test (Adaptive Lambda + Gloss)...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    start_init_time = time.time()
-    mue_pipe = MUEDiffusionPipeline(device="cuda" if torch.cuda.is_available() else "cpu")
-    end_init_time = time.time()
-    print(f"Pipeline initialization time: {end_init_time - start_init_time:.2f} seconds")
+    mue_pipe = MUEDiffusionPipeline(device=device)
+    # [FIXED] Instantiate both DIS and Gloss calculators
+    dis_calculator = DISCalculator(device=device)
+    gloss_calculator = GlossCalculator(device=device)
+    print("Pipeline, DIS, and Gloss Calculators initialized.")
 
     # --- 3. Generation Parameters ---
     prompt = "photo of a majestic lion in the african savanna, sunset lighting"
@@ -54,7 +60,8 @@ if __name__ == "__main__":
     seed = 2025
 
     # --- 4. Define Callback Kwargs ---
-    callback_kwargs = {"model_name": "Base"} # Simplified for this test
+    # [FIXED] Pass the dis_calculator instance
+    callback_kwargs = {"dis_calculator_instance": dis_calculator}
 
     # --- 5. Perform Generation with Full MUE ---
     start_gen_time = time.time()
@@ -63,9 +70,13 @@ if __name__ == "__main__":
         negative_prompt=negative_prompt,
         initial_guidance_scale=8.0,
         seed=seed,
+        # DIS parameters
         callback_on_step_end=mue_callback,
         callback_on_step_end_kwargs_base=callback_kwargs,
+        # Note: Gloss is not applied in refiner by this design, but DIS is.
+        callback_on_step_end_kwargs_refiner={"model_name": "Refiner", "dis_calculator_instance": dis_calculator},
         # Gloss parameters
+        gloss_calculator=gloss_calculator, # [FIXED] Pass the gloss_calculator instance
         gloss_target=GLOSS_TARGET_CONCEPT,
         gloss_strength=GLOSS_STRENGTH,
         gloss_gradient_clip_norm=GLOSS_GRADIENT_CLIP_NORM,

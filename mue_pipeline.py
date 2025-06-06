@@ -1,10 +1,10 @@
-# File: mue_pipeline.py
+# File: mue_pipeline.py (Corrected)
 
 import torch
 from PIL import Image
 from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
-from typing import Callable, List, Optional, Union, Dict, Any
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline, StableDiffusionXLRefinerPipeline
+from typing import Callable, List, Optional, Union, Dict, Any, Tuple
 
 from dis_module import DISCalculator
 from gloss_module import GlossCalculator
@@ -13,6 +13,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss). Optimized with torch.compile.
+    (Version 2.0 - With critical bug fixes and enhancements)
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         super().__init__()
@@ -32,10 +33,10 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         del pipe_base
 
         # Load Refiner components efficiently
-        pipe_refiner = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
+        pipe_refiner = StableDiffusionXLRefinerPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
         self.unet_refiner = pipe_refiner.unet.to(self.device)
-        self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self.device)
-        self.tokenizer_refiner = pipe_refiner.tokenizer_2
+        self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self.device) # Refiner only has text_encoder_2
+        self.tokenizer_refiner = pipe_refiner.tokenizer_2 # Refiner only has tokenizer_2
         self.scheduler_refiner = DPMSolverMultistepScheduler.from_config(pipe_refiner.scheduler.config, use_karras_sigmas=True)
         del pipe_refiner
 
@@ -43,28 +44,61 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         self.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=self.torch_dtype).to(self.device)
 
         if compile_models:
-            print("Compiling UNets and VAE with torch.compile...")
+            print("Compiling UNets, VAE, and Text Encoders with torch.compile...")
             self.unet_base = torch.compile(self.unet_base, mode="default", fullgraph=True)
             self.unet_refiner = torch.compile(self.unet_refiner, mode="default", fullgraph=True)
             self.vae.decode = torch.compile(self.vae.decode, mode="default", fullgraph=True)
-            print("UNets and VAE compiled.")
+            # Compiling text encoders can provide a noticeable speedup
+            self.text_encoder_base = torch.compile(self.text_encoder_base, mode="default", fullgraph=True)
+            self.text_encoder_2_base = torch.compile(self.text_encoder_2_base, mode="default", fullgraph=True)
+            self.text_encoder_refiner = torch.compile(self.text_encoder_refiner, mode="default", fullgraph=True)
+            print("Models compiled.")
 
         print("MUEDiffusionPipeline initialization complete.")
 
-    def _encode_prompt(self, text_encoder, text_encoder_2, tokenizer, tokenizer_2, prompt, negative_prompt):
-        # Create a temporary minimal pipeline for prompt encoding
+    def _encode_base_prompt(self, prompt, negative_prompt):
+        """ Encodes prompts for the Base SDXL model. """
+        # A minimal pipeline for using the robust encode_prompt method
         temp_pipe = StableDiffusionXLPipeline(
-            vae=self.vae, text_encoder=text_encoder, text_encoder_2=text_encoder_2, tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2, unet=self.unet_base, scheduler=self.scheduler_base
+            vae=self.vae, text_encoder=self.text_encoder_base, text_encoder_2=self.text_encoder_2_base,
+            tokenizer=self.tokenizer_base, tokenizer_2=self.tokenizer_2_base, unet=self.unet_base,
+            scheduler=self.scheduler_base
         )
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = \
             temp_pipe.encode_prompt(prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=negative_prompt)
         del temp_pipe
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
-    def _prepare_added_cond_kwargs(self, height, width, batch_size):
+    def _encode_refiner_prompt(self, prompt, negative_prompt) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ [FIXED] Correctly encodes prompts for the SDXL Refiner model. """
+        # The refiner uses a different pipeline and only text_encoder_2
+        temp_pipe = StableDiffusionXLRefinerPipeline(
+            vae=self.vae, text_encoder_2=self.text_encoder_refiner, tokenizer_2=self.tokenizer_refiner,
+            unet=self.unet_refiner, scheduler=self.scheduler_refiner
+        )
+        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = \
+            temp_pipe.encode_prompt(prompt, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=negative_prompt)
+        
+        # The refiner pipeline concatenates the embeds for us, so we can use them directly.
+        # It combines the prompt_embeds and pooled_prompt_embeds into a single tensor.
+        # We need to manually combine them for our custom loop.
+        prompt_embeds = torch.cat([prompt_embeds, pooled_prompt_embeds], dim=-1)
+        negative_prompt_embeds = torch.cat([negative_prompt_embeds, negative_pooled_prompt_embeds], dim=-1)
+        del temp_pipe
+        return prompt_embeds, negative_prompt_embeds
+
+
+    def _prepare_added_cond_kwargs_base(self, height, width, batch_size):
         add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=self.device, dtype=self.torch_dtype)
-        return {"add_time_ids": add_time_ids.repeat(batch_size, 1)}
+        return {"add_time_ids": add_time_ids.repeat(batch_size * 1, 1)}
+
+    def _prepare_added_cond_kwargs_refiner(self, height, width, batch_size):
+        # Refiner uses different default values for aesthetic score
+        add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=self.device, dtype=self.torch_dtype)
+        # Refiner's aesthetic embedding
+        add_aesthetic_embeds = torch.tensor([[2.5, 2.5, 2.5, 2.5, 2.5, 2.5]], device=self.device, dtype=self.torch_dtype)
+        
+        return {"add_time_ids": add_time_ids.repeat(batch_size, 1), "add_aesthetic_embeds": add_aesthetic_embeds.repeat(batch_size, 1)}
 
     @torch.no_grad()
     def __call__(
@@ -88,16 +122,18 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         gloss_gradient_clip_norm: float = 1.0,
         gloss_active_start_step: int = 0,
         **kwargs,
-    ) -> Dict[str, List[Image.Image]]:
+    ) -> Dict[str, Union[List[Image.Image], Any]]:
         batch_size = 1
+        if isinstance(prompt, list):
+             batch_size = len(prompt)
+
         if gloss_calculator:
             gloss_calculator.set_target(gloss_target)
 
         # 1. Prompt Encoding
-        prompt_embeds_b, neg_p_embeds_b, pooled_embeds_b, neg_pooled_embeds_b = self._encode_prompt(
-            self.text_encoder_base, self.text_encoder_2_base, self.tokenizer_base, self.tokenizer_2_base, prompt, negative_prompt)
-        prompt_embeds_r, neg_p_embeds_r, pooled_embeds_r, neg_pooled_embeds_r = self._encode_prompt(
-            self.text_encoder_base, self.text_encoder_refiner, self.tokenizer_base, self.tokenizer_refiner, prompt, negative_prompt)
+        prompt_embeds_b, neg_p_embeds_b, pooled_embeds_b, neg_pooled_embeds_b = self._encode_base_prompt(prompt, negative_prompt)
+        # [FIXED] Use the correct refiner encoding method
+        prompt_embeds_r, neg_p_embeds_r = self._encode_refiner_prompt(prompt, negative_prompt)
 
         # 2. Latent & Timestep Preparation
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -110,7 +146,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         current_guidance_scale = initial_guidance_scale
         base_denoise_end_step = int(num_inference_steps_base * denoising_end)
 
-        added_cond_kwargs = self._prepare_added_cond_kwargs(height, width, batch_size)
+        added_cond_kwargs_b = self._prepare_added_cond_kwargs_base(height, width, batch_size)
         prompt_embeds_b = torch.cat([neg_p_embeds_b, prompt_embeds_b])
         added_text_embeds_b = torch.cat([neg_pooled_embeds_b, pooled_embeds_b])
         
@@ -121,54 +157,80 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             latent_model_input = self.scheduler_base.scale_model_input(latent_model_input, t)
             
             # Enable gradient tracking for Gloss if needed
-            if gloss_calculator and i >= gloss_active_start_step and gloss_strength > 0:
-                latent_model_input.requires_grad_(True)
+            is_gloss_active = gloss_calculator and i >= gloss_active_start_step and gloss_strength > 0
+            if is_gloss_active:
+                latents.requires_grad_(True)
 
             noise_pred = self.unet_base(
                 latent_model_input, t,
                 encoder_hidden_states=prompt_embeds_b,
-                added_cond_kwargs={**added_cond_kwargs, "text_embeds": added_text_embeds_b}
+                added_cond_kwargs={"text_embeds": added_text_embeds_b, **added_cond_kwargs_b}
             ).sample
+            
+            if is_gloss_active:
+                 latents.requires_grad_(False)
             
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             guided_noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             # --- Gloss Gradient Application ---
-            if gloss_calculator and i >= gloss_active_start_step and gloss_strength > 0:
+            if is_gloss_active:
                 with torch.enable_grad():
+                     latents.requires_grad_(True)
                      gloss_grad = gloss_calculator.calculate_gloss_gradient(
-                         latent_model_input[:batch_size], guided_noise_pred, t, self.scheduler_base, self.vae, gloss_strength, gloss_gradient_clip_norm)
-                latents = latents - gloss_grad
-                latents = latents.detach() # Detach after steering
+                         latents, guided_noise_pred, t, self.scheduler_base, self.vae, gloss_strength, gloss_gradient_clip_norm)
+                     latents.requires_grad_(False)
+                
+                # Perform gradient descent on latents
+                latents = latents.detach() - gloss_grad
+            
+            # --- Scheduler Step ---
+            latents = self.scheduler_base.step(guided_noise_pred, t, latents).prev_sample
 
             # --- DIS Callback for Adaptive Lambda ---
             if callback_on_step_end:
-                current_guidance_scale = callback_on_step_end(
+                new_guidance_scale = callback_on_step_end(
                     step=i, timestep=int(t), latents=latents,
                     current_guidance_scale=current_guidance_scale, callback_kwargs=final_cb_kwargs_base)
+                current_guidance_scale = new_guidance_scale or current_guidance_scale
 
-            latents = self.scheduler_base.step(guided_noise_pred, t, latents).prev_sample
 
         # 4. Refiner Denoising Loop
         self.scheduler_refiner.set_timesteps(num_inference_steps_refiner, device=self.device)
         timesteps_refiner = self.scheduler_refiner.timesteps[int(num_inference_steps_refiner * (1-denoising_start)):]
+        
         prompt_embeds_r = torch.cat([neg_p_embeds_r, prompt_embeds_r])
-        added_text_embeds_r = torch.cat([neg_pooled_embeds_r, pooled_embeds_r])
+        added_cond_kwargs_r = self._prepare_added_cond_kwargs_refiner(height, width, batch_size)
+        
+        # [FIXED] Prepare kwargs for refiner callback
+        final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
         for i, t in enumerate(self.progress_bar(timesteps_refiner)):
             latent_model_input = torch.cat([latents] * 2)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
+            
+            # Note: Refiner's added_cond_kwargs are structured differently
+            added_cond_kwargs = {"text_embeds": prompt_embeds_r, **added_cond_kwargs_r}
+
             noise_pred = self.unet_refiner(
                 latent_model_input, t,
-                encoder_hidden_states=prompt_embeds_r,
-                added_cond_kwargs={**added_cond_kwargs, "text_embeds": added_text_embeds_r}
+                encoder_hidden_states=None, # Refiner passes embeddings through added_cond_kwargs
+                added_cond_kwargs=added_cond_kwargs
             ).sample
+            
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             guided_noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred_text - noise_pred_uncond)
             latents = self.scheduler_refiner.step(guided_noise_pred, t, latents).prev_sample
+            
+            # [FIXED] Add callback hook to refiner loop
+            if callback_on_step_end:
+                new_guidance_scale = callback_on_step_end(
+                    step=i + base_denoise_end_step, timestep=int(t), latents=latents,
+                    current_guidance_scale=current_guidance_scale, callback_kwargs=final_cb_kwargs_refiner)
+                current_guidance_scale = new_guidance_scale or current_guidance_scale
 
         # 5. VAE Decoding
         image = self.vae.decode(latents / self.vae.config.scaling_factor).sample
-        image = self.numpy_to_pil((image / 2 + 0.5).clamp(0, 1).cpu().permute(0, 2, 3, 1).numpy())
+        image = self.image_processor.postprocess(image, output_type="pil")
         
         return {"images": image}
