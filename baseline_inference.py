@@ -1,7 +1,7 @@
 import torch
 import time
 from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
-from diffusers.utils import export_to_image
+#from diffusers.utils import export_to_image
 
 print("Starting Phase 0: Baseline Inference Setup...")
 
