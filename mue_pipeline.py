@@ -15,7 +15,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     and gradient-based steering (Gloss).
     (Version 6.0 - Precise fix for Refiner added_cond_kwargs to prevent 2x3072 error.
     Ensures _get_add_time_ids for refiner correctly bundles aesthetic score into the 7-dim tensor,
-    and added_cond_kwargs passed to refiner UNet only contains "text_embeds" and "time_ids".)
+    and added_cond_kwargs passed to refiner UNet only contains "text_embeds" and "time_ids".
+    FIXED: Runtime Error (2x3072 vs 2560x1536) by disabling requires_aesthetics_score in refiner UNet config.)
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -94,6 +95,17 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # Load Refiner Pipeline and extract components
         pipe_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
         self.unet_refiner = pipe_refiner.unet.to(self._target_device)
+        
+        # --- FIX START: Crucial adjustment for Refiner UNet config ---
+        # The Refiner UNet's add_embedding.linear_1 layer expects 2560 input features,
+        # but its get_aug_embed logic (if requires_aesthetics_score is True) tries to add a 512-dim aesthetic_score
+        # on top of text_embeds and time_ids_proj, leading to 3072.
+        # By setting requires_aesthetics_score to False, we prevent the extra 512-dim concatenation,
+        # ensuring the input is correctly 2560. The aesthetic score is still correctly bundled in time_ids.
+        if hasattr(self.unet_refiner.config, 'requires_aesthetics_score'):
+            self.unet_refiner.config.requires_aesthetics_score = False
+        # --- FIX END ---
+        
         self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self._target_device) # Refiner only uses text_encoder_2
         self.tokenizer_refiner = pipe_refiner.tokenizer_2
         self.scheduler_refiner = DPMSolverMultistepScheduler.from_config(pipe_refiner.scheduler.config, use_karras_sigmas=True)
@@ -308,9 +320,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         final_cb_kwargs_base = {**(callback_on_step_end_kwargs_base or {}), 'vae': self.vae}
 
         print(f"Starting Base Denoising Loop ({base_denoise_end_step} steps)...")
-        # --- FIX START ---
-        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step])): # Removed 'desc'
-        # --- FIX END ---
+        # Removed 'desc' to fix TypeError
+        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step])):
             # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_base.scale_model_input(latent_model_input, t)
@@ -397,9 +408,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
         print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...")
-        # --- FIX START ---
-        for i, t in enumerate(self.progress_bar(timesteps_refiner)): # Removed 'desc'
-        # --- FIX END ---
+        # Removed 'desc' to fix TypeError
+        for i, t in enumerate(self.progress_bar(timesteps_refiner)):
             # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
