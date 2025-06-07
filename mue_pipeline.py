@@ -13,10 +13,11 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss).
-    (Version 6.0 - Precise fix for Refiner added_cond_kwargs to prevent 2x3072 error.
+    (Version 6.1 - Finalized fix for Refiner added_cond_kwargs to prevent 2x3072 error.
     Ensures _get_add_time_ids for refiner correctly bundles aesthetic score into the 7-dim tensor,
     and added_cond_kwargs passed to refiner UNet only contains "text_embeds" and "time_ids".
-    FIXED: Runtime Error (2x3072 vs 2560x1536) by disabling requires_aesthetics_score in refiner UNet config.)
+    FIXED: Runtime Error (2x3072 vs 2560x1536) by explicitly setting
+    self.unet_refiner.config.requires_aesthetics_score = False after loading the refiner UNet.
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -96,7 +97,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         pipe_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
         self.unet_refiner = pipe_refiner.unet.to(self._target_device)
         
-        # --- FIX START: Crucial adjustment for Refiner UNet config ---
+        # --- CRITICAL FIX START ---
         # The Refiner UNet's add_embedding.linear_1 layer expects 2560 input features,
         # but its get_aug_embed logic (if requires_aesthetics_score is True) tries to add a 512-dim aesthetic_score
         # on top of text_embeds and time_ids_proj, leading to 3072.
@@ -104,7 +105,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # ensuring the input is correctly 2560. The aesthetic score is still correctly bundled in time_ids.
         if hasattr(self.unet_refiner.config, 'requires_aesthetics_score'):
             self.unet_refiner.config.requires_aesthetics_score = False
-        # --- FIX END ---
+        # --- CRITICAL FIX END ---
         
         self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self._target_device) # Refiner only uses text_encoder_2
         self.tokenizer_refiner = pipe_refiner.tokenizer_2
