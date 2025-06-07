@@ -13,11 +13,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
     """
     A self-contained MUE pipeline with a manual denoising loop for adaptive guidance (DIS)
     and gradient-based steering (Gloss).
-    (Version 6.1 - Finalized fix for Refiner added_cond_kwargs to prevent 2x3072 error.
-    Ensures _get_add_time_ids for refiner correctly bundles aesthetic score into the 7-dim tensor,
-    and added_cond_kwargs passed to refiner UNet only contains "text_embeds" and "time_ids".
-    FIXED: Runtime Error (2x3072 vs 2560x1536) by explicitly setting
-    self.unet_refiner.config.requires_aesthetics_score = False after loading the refiner UNet.
+    (Version 6.2 - Definitive fix for Refiner added_cond_kwargs dimensional mismatch.
+    The fix targets `unet_refiner.config.addition_embed_type` to align input dimensions.)
     """
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.float16, compile_models: bool = False):
         """
@@ -97,16 +94,24 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         pipe_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
         self.unet_refiner = pipe_refiner.unet.to(self._target_device)
         
-        # --- CRITICAL FIX START ---
-        # The Refiner UNet's add_embedding.linear_1 layer expects 2560 input features,
-        # but its get_aug_embed logic (if requires_aesthetics_score is True) tries to add a 512-dim aesthetic_score
-        # on top of text_embeds and time_ids_proj, leading to 3072.
-        # By setting requires_aesthetics_score to False, we prevent the extra 512-dim concatenation,
-        # ensuring the input is correctly 2560. The aesthetic score is still correctly bundled in time_ids.
+        # --- DEFINITIVE FIX FOR REFINER DIMENSIONAL MISMATCH ---
+        # The Refiner UNet's `add_embedding.linear_1` layer expects 2560 input features.
+        # However, if its `config.addition_embed_type` is "text_time_ids_and_aesthetic_score",
+        # the `get_aug_embed` method will try to create a 3072-dim input (1280 text + 1280 time_ids + 512 aesthetic).
+        # We explicitly set `addition_embed_type` to "text_time_ids" to ensure only 2560 features are generated
+        # (1280 text + 1280 time_ids, where the 7-dim time_ids tensor already includes the aesthetic score).
+        print(f"Original Refiner UNet addition_embed_type: {self.unet_refiner.config.addition_embed_type}")
+        if hasattr(self.unet_refiner.config, 'addition_embed_type'):
+            self.unet_refiner.config.addition_embed_type = "text_time_ids"
+            print(f"Set Refiner UNet addition_embed_type to: {self.unet_refiner.config.addition_embed_type}")
+        
+        # While related, `requires_aesthetics_score` mainly controls validation checks,
+        # but the actual concatenation logic in `get_aug_embed` depends on `addition_embed_type`.
+        # Setting it to False for good measure, though the `addition_embed_type` change is key.
         if hasattr(self.unet_refiner.config, 'requires_aesthetics_score'):
             self.unet_refiner.config.requires_aesthetics_score = False
-        # --- CRITICAL FIX END ---
-        
+        # --- END DEFINITIVE FIX ---
+
         self.text_encoder_refiner = pipe_refiner.text_encoder_2.to(self._target_device) # Refiner only uses text_encoder_2
         self.tokenizer_refiner = pipe_refiner.tokenizer_2
         self.scheduler_refiner = DPMSolverMultistepScheduler.from_config(pipe_refiner.scheduler.config, use_karras_sigmas=True)
@@ -401,7 +406,8 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         )
 
         # Final `added_cond_kwargs` for refiner: ONLY `text_embeds` and `time_ids` (7-dim)
-        # Do NOT add a separate "aesthetic_score" key here. The UNet handles its internal projection.
+        # Do NOT add a separate "aesthetic_score" key here. The UNet handles its internal projection
+        # based on `addition_embed_type`. With `addition_embed_type="text_time_ids"`, it won't look for it.
         final_added_cond_kwargs_refiner = {
             "text_embeds": add_text_embeds_r_cfg,
             "time_ids": add_time_ids_refiner # This 2x7 tensor already includes aesthetic scores
