@@ -308,8 +308,9 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         final_cb_kwargs_base = {**(callback_on_step_end_kwargs_base or {}), 'vae': self.vae}
 
         print(f"Starting Base Denoising Loop ({base_denoise_end_step} steps)...")
-        # Use self.progress_bar for consistent progress bar display
-        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step], desc="Base Denoising")):
+        # --- FIX START ---
+        for i, t in enumerate(self.progress_bar(timesteps_base[:base_denoise_end_step])): # Removed 'desc'
+        # --- FIX END ---
             # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_base.scale_model_input(latent_model_input, t)
@@ -396,7 +397,9 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         final_cb_kwargs_refiner = {**(callback_on_step_end_kwargs_refiner or {}), 'vae': self.vae}
 
         print(f"Starting Refiner Denoising Loop ({len(timesteps_refiner)} steps)...")
-        for i, t in enumerate(self.progress_bar(timesteps_refiner, desc="Refiner Denoising")):
+        # --- FIX START ---
+        for i, t in enumerate(self.progress_bar(timesteps_refiner)): # Removed 'desc'
+        # --- FIX END ---
             # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
