@@ -1,5 +1,6 @@
 # File: run_phase4.py (Corrected)
-
+mue_pipe = MUEDiffusionPipeline(device=device)
+mue_pipe.enable_model_cpu_offload() # Add this line
 import torch
 import time
 from mue_pipeline import MUEDiffusionPipeline
