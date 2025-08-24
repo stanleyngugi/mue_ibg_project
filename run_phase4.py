@@ -1,13 +1,11 @@
 # File: run_phase4.py (Corrected)
+
 import torch
 import time
 from mue_pipeline import MUEDiffusionPipeline
 from dis_module import DISCalculator   # [FIXED] Import DISCalculator
 from gloss_module import GlossCalculator # [FIXED] Import GlossCalculator
 from typing import Dict, Any
-
-mue_pipe = MUEDiffusionPipeline(device = "cuda" if torch.cuda.is_available() else "cpu")
-mue_pipe.enable_model_cpu_offload() # Add this line
 
 # --- MUE Parameters ---
 MIN_GUIDANCE_SCALE = 4.0
