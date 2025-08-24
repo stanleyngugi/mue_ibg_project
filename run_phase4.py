@@ -6,7 +6,7 @@ from dis_module import DISCalculator   # [FIXED] Import DISCalculator
 from gloss_module import GlossCalculator # [FIXED] Import GlossCalculator
 from typing import Dict, Any
 
-mue_pipe = MUEDiffusionPipeline(device=device)
+mue_pipe = MUEDiffusionPipeline(device = "cuda" if torch.cuda.is_available() else "cpu")
 mue_pipe.enable_model_cpu_offload() # Add this line
 
 # --- MUE Parameters ---
