@@ -3,9 +3,13 @@
 import torch
 import time
 from mue_pipeline import MUEDiffusionPipeline
-from dis_module import DISCalculator   # [FIXED] Import DISCalculator
-from gloss_module import GlossCalculator # [FIXED] Import GlossCalculator
+from dis_module import DISCalculator
+from gloss_module import GlossCalculator
 from typing import Dict, Any
+
+# Add this to enable expandable segments and reduce fragmentation
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # --- MUE Parameters ---
 MIN_GUIDANCE_SCALE = 4.0
@@ -27,7 +31,8 @@ def mue_callback(step: int, timestep: int, latents: torch.Tensor, current_guidan
     vae = callback_kwargs.get("vae")
     
     if dis_calculator and vae:
-        dis_score = dis_calculator.calculate_dis(latents=latents, vae=vae)
+        # [MODIFIED] Reduced perturbations for memory efficiency
+        dis_score = dis_calculator.calculate_dis(latents=latents, vae=vae, num_perturbations=3)
         print(f"[Base] Step {step:02d} | DIS={dis_score:.5f} | In λ={current_guidance_scale:.2f}", end="")
         
         if dis_score < DIS_STABLE_THRESHOLD:
