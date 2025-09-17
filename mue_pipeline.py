@@ -287,6 +287,17 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         )
         print("Prompt encoding complete.")
 
+        # Offload text encoders to CPU to free GPU memory (used only for encoding)
+        if "cuda" in self._target_device:
+            if self.text_encoder_base is not None:
+                self.text_encoder_base.to("cpu")
+            if hasattr(self, 'text_encoder_2_base'):
+                self.text_encoder_2_base.to("cpu")
+            if hasattr(self, 'text_encoder_refiner'):
+                self.text_encoder_refiner.to("cpu")
+            torch.cuda.empty_cache()
+            print("Text encoders offloaded to CPU to free GPU memory.")
+
         # 2. Latent & Timestep Preparation
         generator = torch.Generator(device=self._target_device).manual_seed(seed)
         latents = torch.randn(
