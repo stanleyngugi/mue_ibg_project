@@ -15,8 +15,11 @@ class GlossCalculator:
         self.device = device
         print(f"Loading CLIP model for Gloss calculation...")
         model_id = "openai/clip-vit-base-patch32"
+        # Use FP16 on CUDA to reduce memory usage and potentially speed up computation.
+        # Otherwise, use FP32 for CPU compatibility and full precision.
+        clip_dtype = torch.float16 if "cuda" in device else torch.float32
         self.clip_processor = CLIPProcessor.from_pretrained(model_id)
-        self.clip_model = CLIPModel.from_pretrained(model_id).to(self.device).eval()
+        self.clip_model = CLIPModel.from_pretrained(model_id, torch_dtype=clip_dtype).to(self.device).eval()
         self.target_text_embedding = None
 
         if compile_models:
@@ -36,12 +39,15 @@ class GlossCalculator:
         print(f"Gloss target set to: '{target_concept}'")
         with torch.no_grad():
             text_inputs = self.clip_processor(text=target_concept, return_tensors="pt").to(self.device)
-            self.target_text_embedding = self.clip_model.get_text_features(**text_inputs).float()
+            # Ensure text embedding matches the model's dtype
+            self.target_text_embedding = self.clip_model.get_text_features(**text_inputs).to(self.clip_model.dtype)
             self.target_text_embedding = F.normalize(self.target_text_embedding, p=2, dim=-1)
 
     def _decode_latents_to_pil(self, latents: torch.Tensor, vae: Any) -> List[Image.Image]:
         """ Decodes latents to PIL Images for CLIP processing. """
-        image = vae.decode(latents / vae.config.scaling_factor).sample
+        # VAE decoding can benefit from FP32 for stability, so temporarily cast
+        original_dtype = latents.dtype
+        image = vae.decode((latents / vae.config.scaling_factor).to(torch.float32)).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.permute(0, 2, 3, 1).cpu().float().numpy()
         return [Image.fromarray((img * 255).astype("uint8")) for img in image]
@@ -69,7 +75,9 @@ class GlossCalculator:
 
         decoded_x0_pil = self._decode_latents_to_pil(predicted_original_sample, vae)
         clip_inputs = self.clip_processor(images=decoded_x0_pil, return_tensors="pt").to(self.device)
-        image_embeds = F.normalize(self.clip_model.get_image_features(**clip_inputs))
+        
+        # Ensure image embeds match the model's dtype for consistency
+        image_embeds = F.normalize(self.clip_model.get_image_features(**clip_inputs).to(self.clip_model.dtype))
 
         loss = (1.0 - F.cosine_similarity(image_embeds, self.target_text_embedding)).mean()
         gloss_grad = torch.autograd.grad(loss, latents, retain_graph=False)[0]
