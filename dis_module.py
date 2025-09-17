@@ -18,11 +18,13 @@ class DISCalculator:
         self.device = device
         print("Loading CLIP model for DIS calculation...")
         model_id = "openai/clip-vit-base-patch32"
+        # Use FP16 on CUDA to halve memory
+        clip_dtype = torch.float16 if "cuda" in device else torch.float32  
         self.clip_processor = CLIPProcessor.from_pretrained(model_id)
-        self.clip_model = CLIPModel.from_pretrained(model_id).to(self.device).eval()
+        self.clip_model = CLIPModel.from_pretrained(model_id, torch_dtype=clip_dtype).to(self.device).eval()
 
         # Initialize VaeImageProcessor here or before first use
-        self._vae_image_processor = None # Will be initialized on first _decode_latents_to_pil call
+        self._vae_image_processor = None  # Will be initialized on first _decode_latents_to_pil call
 
         # --- Apply torch.compile to CLIP if enabled ---
         if compile_models:
@@ -85,7 +87,8 @@ class DISCalculator:
         # original_pil will now be a list of 1 PIL Image
         original_pil = self._decode_latents_to_pil(latents, vae)
         original_inputs = self.clip_processor(images=original_pil, return_tensors="pt").to(self.device)
-        original_embeds = F.normalize(self.clip_model.get_image_features(**original_inputs).float()) # Ensure float for F.normalize
+        # Ensure float for F.normalize. CLIP is loaded with fp16 on CUDA.
+        original_embeds = F.normalize(self.clip_model.get_image_features(**original_inputs).float()) 
 
         noise = torch.randn(
             (num_perturbations, *latents.shape[1:]),
@@ -100,7 +103,8 @@ class DISCalculator:
         perturbed_pils = self._decode_latents_to_pil(perturbed_latents, vae)
         
         perturbed_inputs = self.clip_processor(images=perturbed_pils, return_tensors="pt").to(self.device)
-        perturbed_embeds = F.normalize(self.clip_model.get_image_features(**perturbed_inputs).float()) # Ensure float for F.normalize
+        # Ensure float for F.normalize. CLIP is loaded with fp16 on CUDA.
+        perturbed_embeds = F.normalize(self.clip_model.get_image_features(**perturbed_inputs).float()) 
 
         similarity = F.cosine_similarity(original_embeds, perturbed_embeds, dim=-1)
         semantic_distance = (1.0 - similarity).mean().item()
