@@ -1,6 +1,6 @@
 import torch
 from PIL import Image
-from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultestepScheduler
+from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
 from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple
 import inspect # For checking default parameters of scheduler's step method
@@ -69,7 +69,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
         # Common kwargs for model loading
         model_loading_kwargs = {
-            "torch_dtype": self.torch_dtype,
+            "dtype": self.torch_dtype, # Fixed: Changed from "torch_dtype" to "dtype"
             "use_safetensors": True,
             "low_cpu_mem_usage": True
         }
@@ -93,7 +93,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # Load Refiner Pipeline and extract components
         pipe_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", **model_loading_kwargs)
         self.unet_refiner = pipe_refiner.unet.to(self._target_device)
-        
+
         # --- DEFINITIVE FIX FOR REFINER DIMENSIONAL MISMATCH ---
         # The Refiner UNet's `add_embedding.linear_1` layer expects 2560 input features.
         # However, if its `config.addition_embed_type` is "text_time_ids_and_aesthetic_score",
@@ -104,7 +104,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         if hasattr(self.unet_refiner.config, 'addition_embed_type'):
             self.unet_refiner.config.addition_embed_type = "text_time_ids"
             print(f"Set Refiner UNet addition_embed_type to: {self.unet_refiner.config.addition_embed_type}")
-        
+
         # While related, `requires_aesthetics_score` mainly controls validation checks,
         # but the actual concatenation logic in `get_aug_embed` depends on `addition_embed_type`.
         # Setting it to False for good measure, though the `addition_embed_type` change is key.
@@ -120,7 +120,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # We'll stick to the pipeline's dtype for consistency unless explicitly CPU.
         vae_load_dtype = torch.float32 if self._target_device == "cpu" else self.torch_dtype
         self.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=vae_load_dtype).to(self._target_device)
-        
+
         # Free up memory from temporary pipeline objects
         del pipe_base
         del pipe_refiner
@@ -165,7 +165,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # Determine pipeline class based on whether text_encoder (CLIPTextModel) is used.
         # Base uses both text_encoder and text_encoder_2. Refiner uses only text_encoder_2.
         pipeline_class = StableDiffusionXLPipeline if text_encoder is not None else StableDiffusionXLImg2ImgPipeline
-        
+
         # Temporarily create a pipeline instance (only with necessary components for encode_prompt)
         temp_pipe = pipeline_class(
             vae=self.vae, # VAE is needed to satisfy pipeline init, but not for encode_prompt
@@ -185,15 +185,15 @@ class MUEDiffusionPipeline(DiffusionPipeline):
                 do_classifier_free_guidance=True, # Always prepare for CFG
                 negative_prompt=negative_prompt
             )
-        
+
         del temp_pipe # Clean up temporary object to free memory
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
     def _get_add_time_ids(
-        self, 
-        original_size: Tuple[int, int], 
-        crops_coords_top_left: Tuple[int, int], 
-        target_size: Tuple[int, int], 
+        self,
+        original_size: Tuple[int, int],
+        crops_coords_top_left: Tuple[int, int],
+        target_size: Tuple[int, int],
         aesthetic_score: Optional[float] = None, # Used only for Refiner (makes it 7-dim)
         negative_aesthetic_score: Optional[float] = None, # Used only for Refiner's negative aesthetic
         dtype: torch.dtype = torch.float32,
@@ -208,9 +208,9 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         The first row is for negative prompt, second for positive.
         """
         add_time_ids_list = list(original_size + crops_coords_top_left + target_size)
-        
+
         add_time_ids_pos = torch.tensor([add_time_ids_list], device=self._target_device, dtype=dtype)
-        
+
         # If aesthetic_score is provided, it's for the Refiner, so we append it
         # and create both positive and negative aesthetic tensors.
         if aesthetic_score is not None and negative_aesthetic_score is not None:
@@ -342,7 +342,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_base.scale_model_input(latent_model_input, t)
-            
+
             is_gloss_active = gloss_calculator and i >= gloss_active_start_step and gloss_strength > 0
             if is_gloss_active:
                 latents.requires_grad_(True) # Enable gradients for Gloss calculation
@@ -371,7 +371,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
                             noise_pred=guided_noise_pred, # Use the guided noise pred
                             current_timestep=t,
                             scheduler=self.scheduler_base,
-                            vae=self.vae, # <-- APPLIED CHANGE HERE
+                            vae=self.vae,
                             gloss_strength=gloss_strength,
                             gradient_clip_norm=gloss_gradient_clip_norm
                         )
@@ -431,7 +431,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             # Prepare latent input for UNet (CFG batch)
             latent_model_input = torch.cat([latents] * 2, dim=0)
             latent_model_input = self.scheduler_refiner.scale_model_input(latent_model_input, t)
-            
+
             # Gloss active for refiner also
             is_gloss_active = gloss_calculator and (i + base_denoise_end_step) >= gloss_active_start_step and gloss_strength > 0
             if is_gloss_active:
@@ -461,7 +461,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
                         noise_pred=guided_noise_pred,
                         current_timestep=t,
                         scheduler=self.scheduler_refiner,
-                        vae=self.vae, # <-- APPLIED CHANGE HERE
+                        vae=self.vae,
                         gloss_strength=gloss_strength,
                         gradient_clip_norm=gloss_gradient_clip_norm
                     )
@@ -472,7 +472,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
             # Scheduler step to denoise latents
             latents = self.scheduler_refiner.step(guided_noise_pred, t, latents, generator=generator).prev_sample
-            
+
             # Callback on step end
             if callback_on_step_end:
                 new_guidance_scale = callback_on_step_end(
@@ -487,7 +487,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
         # 5. VAE Decoding
         print("Decoding latents to image...")
         image = self.vae.decode(latents / self.vae.config.scaling_factor).sample
-        
+
         # Post-processing using Diffusers' VaeImageProcessor
         # Initialize if not already present (e.g., if DiffusionPipeline init doesn't set it)
         if not hasattr(self, 'image_processor') or self.image_processor is None:
@@ -496,5 +496,5 @@ class MUEDiffusionPipeline(DiffusionPipeline):
 
         image = self.image_processor.postprocess(image, output_type=output_type)
         print("Image decoding complete.")
-        
+
         return {"images": image}
