@@ -1,6 +1,6 @@
 import torch
 from PIL import Image
-from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
+from diffusers import DiffusionPipeline, AutoencoderKL, DPMSolverMultestepScheduler
 from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple
 import inspect # For checking default parameters of scheduler's step method
@@ -356,7 +356,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             ).sample # Access the 'sample' attribute from UNetOutput
 
             if is_gloss_active:
-                 latents.requires_grad_(False) # Disable gradients after UNet call
+                latents.requires_grad_(False) # Disable gradients after UNet call
 
             # Perform Classifier-Free Guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
@@ -365,17 +365,17 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             # Apply Gloss if active
             if is_gloss_active:
                 with torch.enable_grad(): # Re-enable gradients for the Gloss calculation
-                     latents.requires_grad_(True)
-                     gloss_grad = gloss_calculator.calculate_gloss_gradient(
-                         latents=latents,
-                         noise_pred=guided_noise_pred, # Use the guided noise pred
-                         current_timestep=t,
-                         scheduler=self.scheduler_base,
-                         vae_decoder=self.vae,
-                         gloss_strength=gloss_strength,
-                         gradient_clip_norm=gloss_gradient_clip_norm
-                     )
-                     latents.requires_grad_(False) # Disable gradients again after Gloss
+                        latents.requires_grad_(True)
+                        gloss_grad = gloss_calculator.calculate_gloss_gradient(
+                            latents=latents,
+                            noise_pred=guided_noise_pred, # Use the guided noise pred
+                            current_timestep=t,
+                            scheduler=self.scheduler_base,
+                            vae=self.vae, # <-- APPLIED CHANGE HERE
+                            gloss_strength=gloss_strength,
+                            gradient_clip_norm=gloss_gradient_clip_norm
+                        )
+                        latents.requires_grad_(False) # Disable gradients again after Gloss
                 latents = latents.detach() - gloss_grad # Apply gradient update
             else:
                 latents = latents.detach() # Ensure latents are detached if Gloss is not active
@@ -446,7 +446,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
             ).sample # Access the 'sample' attribute from UNetOutput
 
             if is_gloss_active:
-                 latents.requires_grad_(False)
+                latents.requires_grad_(False)
 
             # Perform Classifier-Free Guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
@@ -461,7 +461,7 @@ class MUEDiffusionPipeline(DiffusionPipeline):
                         noise_pred=guided_noise_pred,
                         current_timestep=t,
                         scheduler=self.scheduler_refiner,
-                        vae_decoder=self.vae,
+                        vae=self.vae, # <-- APPLIED CHANGE HERE
                         gloss_strength=gloss_strength,
                         gradient_clip_norm=gloss_gradient_clip_norm
                     )
